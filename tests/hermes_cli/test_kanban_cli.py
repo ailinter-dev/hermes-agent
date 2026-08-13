@@ -154,6 +154,41 @@ def test_run_slash_reclaim_running_task(kanban_home):
     assert "ready" in out2.lower()
 
 
+# ---------------------------------------------------------------------------
+# show — connection lifecycle regression (use-after-close)
+# ---------------------------------------------------------------------------
+
+def test_run_slash_show_uses_conn_only_inside_connect_closing(kanban_home):
+    """`show` must not touch the DB connection after connect_closing()
+    closes it. Regression for the sqlite3 'Cannot operate on a closed
+    database' crash on `hermes kanban show <id>` — the diagnostics
+    section called kb.task_graph_context(conn, ...) after the `with`
+    block had already closed the connection."""
+    import re
+
+    out1 = kc.run_slash("create 'show regression task'")
+    m = re.search(r"(t_[a-f0-9]+)", out1)
+    assert m
+    parent = m.group(1)
+    out2 = kc.run_slash("create 'show regression child'")
+    m2 = re.search(r"(t_[a-f0-9]+)", out2)
+    assert m2
+    child = m2.group(1)
+    # Link them so the graph query in the diagnostics path has rows.
+    kc.run_slash(f"link {parent} {child}")
+
+    # Non-JSON path: diagnostics engine reads the graph.
+    shown = kc.run_slash(f"show {parent}")
+    assert "Task" in shown and "children:" in shown
+    assert "error:" not in shown
+
+    # JSON path must also survive (same handler, different branch).
+    shown_json = kc.run_slash(f"show {parent} --json")
+    payload = json.loads(shown_json)
+    assert payload["task"]["id"] == parent
+    assert payload["children"] == [child]
+
+
 
 
 # ---------------------------------------------------------------------------
