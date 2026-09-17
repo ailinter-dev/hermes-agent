@@ -483,6 +483,71 @@ def test_active_pr_guard_skipped_for_review_lane_but_defers_ready_lane(
         ) == "rate_limit_cooldown"
 
 
+def test_active_pr_guard_ignores_filer_source_citation(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A PR URL *cited* by the agent that filed the card must not hold it.
+
+    The guard regex matches any github.com PR URL in a recent comment, so a
+    card that cites the upstream PR it was filed about (this board's FOUND
+    convention) looked identical to "the worker already opened a PR" and sat
+    held for 24h even though it was ready with a valid assignee.
+
+    Attribution rule under test: a PR-URL comment authored by the identity
+    that FILED the card, on a card that identity has never run, is a source
+    citation. Both halves are load-bearing, so all three cases are pinned:
+    cited-by-filer is schedulable, a different author still holds, and a
+    filer that has run the card still holds.
+    """
+    import hermes_cli.config as cfgmod
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+    monkeypatch.setattr(
+        cfgmod, "load_config",
+        lambda *a, **k: {"kanban": {"review_dispatch": True}},
+    )
+    cited = (
+        "Source: upstream fix "
+        "https://github.com/NousResearch/hermes-agent/pull/112545 "
+        "was merged 2h after this install's HEAD."
+    )
+    opened = "Opened https://github.com/example/repo/pull/123 for review."
+
+    with kbc.connect() as conn:
+        # (i) Cited by the filer, never run by it -> NOT a duplicate-PR signal.
+        cited_id = kb.create_task(
+            conn, title="chase the upstream fix", assignee="developer",
+            created_by="filer-profile",
+        )
+        kb.add_comment(conn, cited_id, author="filer-profile", body=cited)
+        assert kbd.check_respawn_guard(conn, cited_id) is None
+
+        # ...and the dispatcher really does spawn it (the card is not
+        # schedulable-looking-but-held; that was the whole bug).
+        res = kbd.dispatch_once(conn, dry_run=True)
+        assert cited_id in [s[0] for s in res.spawned]
+        assert dict(res.respawn_guarded).get(cited_id) is None
+
+        # (ii) A genuine PR-open comment from another identity still holds.
+        pr_id = kb.create_task(
+            conn, title="worker already PRed", assignee="worker",
+            created_by="filer-profile",
+        )
+        kb.add_comment(conn, pr_id, author="worker", body=opened)
+        assert kbd.check_respawn_guard(conn, pr_id) == "active_pr"
+
+        # (iii) Filer that has ALSO run the card: its PR comment is worker
+        # output, not a citation — the exemption must not swallow it.
+        ran_id = kb.create_task(
+            conn, title="filer also works this one", assignee="filer-profile",
+            created_by="filer-profile",
+        )
+        assert kb.claim_task(conn, ran_id) is not None
+        kb.add_comment(conn, ran_id, author="filer-profile", body=opened)
+        assert kbd.check_respawn_guard(conn, ran_id) == "active_pr"
+
+
 def test_dispatch_json_exposes_suppression_reasons(
     kanban_home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

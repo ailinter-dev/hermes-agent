@@ -131,7 +131,8 @@ class DispatchResult:
     respawn_guarded: list[tuple[str, str]] = field(default_factory=list)
     """``(task_id, reason)`` skipped by the respawn guard: ``"blocker_auth"``
     (quota/auth error — also auto-blocked), ``"recent_success"`` (completed run
-    within guard window), ``"active_pr"`` (GitHub PR URL in a recent comment)."""
+    within guard window), ``"active_pr"`` (GitHub PR URL in a recent comment from
+    someone other than the card's own filer)."""
     rate_limited: list[str] = field(default_factory=list)
     """Task ids whose workers bailed on a provider rate-limit / quota wall
     (EX_TEMPFAIL sentinel exit) and were released to ``ready`` WITHOUT counting
@@ -1375,12 +1376,15 @@ def check_respawn_guard(
     (quota/auth pattern; the breaker still trips eventually), then for the
     ready lane only ``"recent_success"`` (completed run within the window, unless
     a re-queue event arrived after it — a deliberate re-run) and ``"active_pr"``
-    (PR URL in a recent comment; re-spawning risks a duplicate PR). The review
+    (PR URL in a recent comment; re-spawning risks a duplicate PR). A PR-URL
+    comment is attributed before it counts: one written by the identity that
+    FILED the card, on a card that identity has never run, is a source citation
+    about the world rather than this worker's own PR (see step 4). The review
     lane skips the last two: they are the *inputs* to a review handoff. Stale /
     dead claim locks are NOT a guard reason — the reclaim passes own those.
     """
     row = conn.execute(
-        "SELECT last_failure_error FROM tasks WHERE id = ?",
+        "SELECT last_failure_error, created_by FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if row is None:
@@ -1444,13 +1448,34 @@ def check_respawn_guard(
             return "recent_success"
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
+    #    Attribution: the guard asks "did a worker of THIS card open a PR?", but
+    #    the regex matches any github.com PR URL in any repo, so a *citation* of
+    #    someone else's PR reads the same as the worker's own. Boards that file
+    #    upstream-fix cards by citing the source PR (the FOUND convention) write
+    #    that citation as the identity that FILED the card, and a card that
+    #    identity has never run has no prior worker whose PR it could be — so the
+    #    card sat held for the full 24h window.
+    #    The exemption stays deliberately narrow: creator identity only, and only
+    #    while it has no run on this card. The moment the filer has run the card,
+    #    its own PR comment is real worker output and holds exactly as before;
+    #    every other author keeps the guard's full protection.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
+    filer = (row["created_by"] or "").strip()
+    filer_ran = False
+    if filer:
+        filer_ran = conn.execute(
+            "SELECT 1 FROM task_runs WHERE task_id = ? AND profile = ? LIMIT 1",
+            (task_id, row["created_by"]),
+        ).fetchone() is not None
     for c in conn.execute(
-        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
+        "SELECT author, body FROM task_comments WHERE task_id = ? AND created_at >= ?",
         (task_id, pr_cutoff),
     ).fetchall():
-        if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
-            return "active_pr"
+        if not c["body"] or not _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
+            continue
+        if filer and not filer_ran and (c["author"] or "").strip() == filer:
+            continue  # source citation filed with the card, not worker output
+        return "active_pr"
 
     return None
 
